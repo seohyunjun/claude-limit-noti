@@ -19,7 +19,7 @@ Claude AI usage limit reached|1735700000
 
 1. 이 저장소를 클론하거나 `notify_usage_limit.py`를 원하는 위치에 저장합니다.
    ```bash
-   git clone <this-repo-url> ~/.claude/hooks/claude-limit-noti
+   git clone https://github.com/seohyunjun/claude-limit-noti ~/.claude/hooks/claude-limit-noti
    chmod +x ~/.claude/hooks/claude-limit-noti/notify_usage_limit.py
    ```
 2. Slack 웹훅 URL을 환경 변수로 설정합니다 (쉘 프로필에 추가 권장: `~/.bashrc`, `~/.zshrc` 등).
