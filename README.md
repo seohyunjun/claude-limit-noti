@@ -46,7 +46,8 @@ Claude AI usage limit reached|1735700000
    SLACK_WEBHOOK_URL="https://hooks.slack.com/services/XXX/YYY/ZZZ" \
      python3 notify_usage_limit.py --test
    ```
-   Slack 채널에 테스트 메시지가 오면 정상 동작하는 것입니다.
+   Slack 채널에 테스트 메시지가 오면 웹훅 연결은 정상 동작하는 것입니다.
+   > **참고**: `--test`가 표시하는 재설정 시각은 실제 사용량 한도와 무관한 "지금+1시간" 더미값입니다. 웹훅 연결만 확인하는 용도이며, 실제 한도 도달 시 전송되는 메시지의 재설정 시각은 Claude Code가 전달하는 실제 epoch 값을 기준으로 계산됩니다.
 
 ## 동작 방식
 

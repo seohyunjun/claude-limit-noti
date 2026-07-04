@@ -174,8 +174,11 @@ def send_slack_message(webhook_url: str, text: str) -> None:
     raise RuntimeError(f"failed to notify Slack: {last_error}")
 
 
-def build_slack_text(cwd: str, reset_epoch) -> str:
-    lines = [":warning: *Claude Code 사용량 한도 도달*"]
+def build_slack_text(cwd: str, reset_epoch, is_test: bool = False) -> str:
+    title = "Claude Code 사용량 한도 도달"
+    if is_test:
+        title += " (테스트 메시지 - 재설정 시각은 실제 값이 아닌 임의값입니다)"
+    lines = [f":warning: *{title}*"]
     if cwd:
         lines.append(f"- 프로젝트 경로: `{cwd}`")
     if reset_epoch:
@@ -192,8 +195,11 @@ def main() -> int:
         if not webhook_url:
             print("SLACK_WEBHOOK_URL is not set.", file=sys.stderr)
             return 1
-        send_slack_message(webhook_url, build_slack_text("(test)", int(time.time()) + 3600))
-        print("Test message sent.")
+        send_slack_message(
+            webhook_url,
+            build_slack_text("(test)", int(time.time()) + 3600, is_test=True),
+        )
+        print("Test message sent. (재설정 시각은 실제 값이 아니라 '지금+1시간' 더미값입니다)")
         return 0
 
     try:
