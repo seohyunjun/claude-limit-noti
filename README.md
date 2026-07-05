@@ -54,8 +54,9 @@ Claude AI usage limit reached|1735700000
 - `Notification` 훅 입력(JSON, stdin)의 `message` 필드에서 한도 도달 패턴을 검사합니다.
 - 매칭되지 않으면 `transcript_path`로 전달된 세션 트랜스크립트(JSONL)의 최근 메시지들도 함께 검사합니다 (한도 메시지가 Notification이 아닌 트랜스크립트 내부에 남는 경우 대비).
 - `Claude AI usage limit reached|<epoch>` 형태가 매칭되면 epoch을 사람이 읽을 수 있는 재설정 시각으로 변환해 Slack 메시지에 포함합니다.
-- 동일한 한도 윈도우(같은 epoch)에 대해 중복 알림을 보내지 않도록 `~/.claude/usage-limit-notifier-state.json`에 마지막으로 알림을 보낸 키를 저장합니다.
+- 동일한 한도 윈도우(같은 epoch)에 대해 중복 알림을 보내지 않도록 `~/.claude/usage-limit-notifier-state.json`에 알림을 보낸 키 목록을 저장합니다.
 - 훅 스크립트는 항상 exit code 0으로 종료합니다. Claude Code 동작을 절대 막지 않기 위함입니다.
+- **한도 도달을 감지하면, 재설정 시각까지 기다렸다가 "이제 다시 사용할 수 있어요" 메시지를 추가로 보내는 별도 프로세스**를 백그라운드로 하나 띄웁니다(내부적으로 자기 자신을 `--wait-reset <epoch>` 인자로 재실행). 이 프로세스는 Claude Code나 훅을 호출한 부모 프로세스가 끝나도 계속 살아있지만, **컴퓨터가 꺼지거나 잠자기 모드에 들어가면 함께 종료**됩니다.
 
 ## 환경 변수
 
@@ -69,8 +70,21 @@ Claude AI usage limit reached|1735700000
 ## 제한 사항
 
 - `Claude AI usage limit reached|<epoch>` 포맷은 Claude Code의 비공식/미문서화된 내부 표기입니다. Claude Code 업데이트로 포맷이 바뀌면 정규식(`LIMIT_PATTERNS`)이 더 이상 매칭하지 않을 수 있습니다. 이 경우 스크립트 상단의 `LIMIT_PATTERNS`를 실제 관측된 메시지에 맞게 수정하세요.
-- 텍스트 전용 폴백 패턴(`usage limit reached` 등)은 매칭되어도 정확한 재설정 시각을 알 수 없습니다.
+- 텍스트 전용 폴백 패턴(`usage limit reached` 등)은 매칭되어도 정확한 재설정 시각을 알 수 없고, 이 경우 재설정 알림용 워처도 뜨지 않습니다(기다릴 정확한 시각을 모르기 때문).
+- 재설정 알림 워처는 백그라운드 OS 프로세스일 뿐이라, **컴퓨터가 꺼지거나 절전 모드에 들어가면 알림이 오지 않습니다.** 노트북을 덮거나 서버를 재시작하는 사이에 한도가 풀리는 경우가 잦다면 이 방식만으로는 놓칠 수 있습니다.
+
+## 테스트
+
+외부 의존성 없이 표준 라이브러리 `unittest`만으로 작성되어 있습니다. 저장소 루트에서 실행하세요.
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+패턴 감지, 타임존 변환, 중복 알림 방지, Slack 전송(mock), 재설정 워처의 스폰 범위 검사는 물론, 실제로
+로컬 mock Slack 서버를 띄우고 스크립트를 subprocess로 구동해 감지→중복방지→알림→재설정 워처까지
+전체 파이프라인을 검증하는 end-to-end 테스트도 포함되어 있습니다.
 
 ## 라이선스
 
-원하는 라이선스를 자유롭게 추가하세요 (예: MIT).
+[MIT](LICENSE)

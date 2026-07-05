@@ -13,6 +13,14 @@ session transcript) for that pattern and posts a message to a Slack
 Incoming Webhook when it fires. A small state file prevents the same
 limit window from re-notifying on every subsequent hook call.
 
+When a new limit-reached event is detected, this script also spawns a
+detached background process (via `--wait-reset`, an internal flag -
+not meant to be invoked directly) that sleeps until the reset epoch
+and then posts a second "usage available again" Slack message. This
+works even if Claude Code itself isn't running at that moment, since
+the watcher is a separate OS process; it does not survive a reboot or
+the machine going to sleep.
+
 Usage as a Claude Code hook (settings.json):
     {
       "hooks": {
@@ -35,6 +43,7 @@ Manual test:
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -48,6 +57,16 @@ STATE_FILE = Path(
         str(Path.home() / ".claude" / "usage-limit-notifier-state.json"),
     )
 )
+
+# How many dedup keys to remember (one "reached" key + one "reset" key per
+# limit window, plus some headroom); prevents the state file from growing
+# forever across many limit windows.
+MAX_TRACKED_KEYS = 20
+
+# A weekly usage limit is the longest window Claude Code currently has;
+# refuse to schedule a watcher further out than this as a sanity guard
+# against a mis-parsed epoch spawning a process that sleeps for years.
+MAX_WATCHER_DELAY_SECONDS = 8 * 24 * 3600
 
 # Order matters: patterns with a captured epoch timestamp are tried first so
 # we can show an exact reset time; the last entry is a text-only fallback in
@@ -146,11 +165,17 @@ def save_state(state: dict) -> None:
 
 
 def already_notified(dedup_key: str) -> bool:
-    return load_state().get("last_dedup_key") == dedup_key
+    return dedup_key in load_state().get("notified_keys", [])
 
 
 def mark_notified(dedup_key: str) -> None:
-    save_state({"last_dedup_key": dedup_key, "notified_at": time.time()})
+    state = load_state()
+    keys = state.get("notified_keys", [])
+    if dedup_key not in keys:
+        keys.append(dedup_key)
+    state["notified_keys"] = keys[-MAX_TRACKED_KEYS:]
+    state["last_notified_at"] = time.time()
+    save_state(state)
 
 
 def send_slack_message(webhook_url: str, text: str) -> None:
@@ -188,7 +213,71 @@ def build_slack_text(cwd: str, reset_epoch, is_test: bool = False) -> str:
     return "\n".join(lines)
 
 
+def build_reset_available_text(cwd: str) -> str:
+    lines = [":white_check_mark: *Claude Code 사용량 한도 초기화*"]
+    if cwd:
+        lines.append(f"- 프로젝트 경로: `{cwd}`")
+    lines.append("- 이제 다시 사용할 수 있어요.")
+    return "\n".join(lines)
+
+
+def spawn_reset_watcher(epoch: int, cwd: str) -> None:
+    """Spawn a detached process that waits for `epoch` and posts a follow-up
+    Slack message once the usage limit resets. Runs as a separate OS process
+    so it keeps waiting even after this hook invocation (and Claude Code)
+    exits; it will not survive the machine rebooting or going to sleep."""
+    delay = epoch - time.time()
+    if delay < -3600 or delay > MAX_WATCHER_DELAY_SECONDS:
+        log(f"not spawning reset watcher, delay out of bounds: {delay:.0f}s")
+        return
+
+    cmd = [sys.executable, str(Path(__file__).resolve()), "--wait-reset", str(epoch), "--cwd", cwd]
+    popen_kwargs = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    else:
+        popen_kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+    try:
+        subprocess.Popen(cmd, **popen_kwargs)
+        log(f"spawned reset watcher for epoch {epoch} (delay={delay:.0f}s)")
+    except OSError as exc:
+        log("failed to spawn reset watcher:", exc)
+
+
+def wait_and_notify_reset(epoch: int, cwd: str) -> int:
+    dedup_key = f"reset:{epoch}"
+    if already_notified(dedup_key):
+        return 0
+
+    delay = epoch - time.time()
+    if delay > 0:
+        time.sleep(delay)
+
+    webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
+    if not webhook_url:
+        log("reset watcher fired but SLACK_WEBHOOK_URL is not set")
+        return 0
+
+    try:
+        send_slack_message(webhook_url, build_reset_available_text(cwd))
+        mark_notified(dedup_key)
+    except RuntimeError as exc:
+        log(str(exc))
+    return 0
+
+
 def main() -> int:
+    if "--wait-reset" in sys.argv:
+        idx = sys.argv.index("--wait-reset")
+        epoch = int(sys.argv[idx + 1])
+        cwd = ""
+        if "--cwd" in sys.argv:
+            cwd_idx = sys.argv.index("--cwd")
+            cwd = sys.argv[cwd_idx + 1]
+        return wait_and_notify_reset(epoch, cwd)
+
     webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
 
     if "--test" in sys.argv:
@@ -233,6 +322,8 @@ def main() -> int:
     try:
         send_slack_message(webhook_url, build_slack_text(cwd, epoch))
         mark_notified(dedup_key)
+        if epoch:
+            spawn_reset_watcher(epoch, cwd)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
 
