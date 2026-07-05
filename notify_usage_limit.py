@@ -58,6 +58,19 @@ STATE_FILE = Path(
     )
 )
 
+# Every hook invocation appends one line here (event name + matched? + a
+# truncated copy of the message), capped to the last MAX_DEBUG_LOG_LINES
+# entries. This is what makes a silent "no notification arrived" reported
+# by a user diagnosable after the fact: it shows whether the hook fired at
+# all, and if it did, whether the real message matched LIMIT_PATTERNS.
+DEBUG_LOG_FILE = Path(
+    os.environ.get(
+        "CLAUDE_LIMIT_NOTIFIER_LOG_FILE",
+        str(Path.home() / ".claude" / "usage-limit-notifier-debug.log"),
+    )
+)
+MAX_DEBUG_LOG_LINES = 200
+
 # How many dedup keys to remember (one "reached" key + one "reset" key per
 # limit window, plus some headroom); prevents the state file from growing
 # forever across many limit windows.
@@ -84,6 +97,31 @@ LIMIT_PATTERNS = [
 def log(*args):
     if os.environ.get("CLAUDE_LIMIT_NOTIFIER_DEBUG"):
         print("[usage-limit-notifier]", *args, file=sys.stderr)
+
+
+def append_debug_log(event_name: str, message: str, matched: bool, epoch) -> None:
+    """Record every hook invocation so a "no notification arrived" report is
+    diagnosable afterwards: did the hook even fire, and if so, did the real
+    message match LIMIT_PATTERNS? Truncates the message to avoid bloating the
+    log with unrelated conversation content, and keeps only the most recent
+    MAX_DEBUG_LOG_LINES entries."""
+    entry = {
+        "at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "event": event_name,
+        "matched": matched,
+        "epoch": epoch,
+        "message_snippet": (message or "")[:300],
+    }
+    try:
+        DEBUG_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        lines = []
+        if DEBUG_LOG_FILE.exists():
+            lines = DEBUG_LOG_FILE.read_text(encoding="utf-8").splitlines()
+        lines.append(json.dumps(entry, ensure_ascii=False))
+        lines = lines[-MAX_DEBUG_LOG_LINES:]
+        DEBUG_LOG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        log("could not write debug log:", exc)
 
 
 def find_limit_message(text: str):
@@ -304,8 +342,16 @@ def main() -> int:
     log(f"event={event_name} message={message!r} transcript={transcript_path}")
 
     matched, epoch = find_limit_message(message)
+    scanned_text = message
     if not matched and transcript_path:
-        matched, epoch = find_limit_message(read_transcript_tail(transcript_path))
+        scanned_text = read_transcript_tail(transcript_path)
+        matched, epoch = find_limit_message(scanned_text)
+
+    # Recorded unconditionally (not just under CLAUDE_LIMIT_NOTIFIER_DEBUG) so a
+    # "no notification arrived" report is diagnosable afterwards even if debug
+    # logging wasn't enabled ahead of time. Set CLAUDE_LIMIT_NOTIFIER_LOG_FILE
+    # to /dev/null to disable.
+    append_debug_log(event_name, scanned_text, matched, epoch)
 
     if not matched:
         return 0

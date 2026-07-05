@@ -131,6 +131,45 @@ class DedupStateTests(unittest.TestCase):
         self.assertNotIn("key-0", state["notified_keys"])
 
 
+class DebugLogTests(unittest.TestCase):
+    """append_debug_log is what makes a 'no notification arrived' report
+    diagnosable after the fact — it must record every hook invocation
+    (matched or not) and never grow without bound."""
+
+    def setUp(self):
+        self.tmpdir = TemporaryDirectory()
+        self._orig_log_file = nul.DEBUG_LOG_FILE
+        nul.DEBUG_LOG_FILE = Path(self.tmpdir.name) / "debug.log"
+
+    def tearDown(self):
+        nul.DEBUG_LOG_FILE = self._orig_log_file
+        self.tmpdir.cleanup()
+
+    def test_appends_one_json_line_per_call(self):
+        nul.append_debug_log("Notification", "waiting for your input", False, None)
+        nul.append_debug_log("Notification", "Claude AI usage limit reached|42", True, 42)
+        lines = nul.DEBUG_LOG_FILE.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2)
+        entry = json.loads(lines[-1])
+        self.assertEqual(entry["event"], "Notification")
+        self.assertTrue(entry["matched"])
+        self.assertEqual(entry["epoch"], 42)
+        self.assertIn("usage limit reached", entry["message_snippet"])
+
+    def test_truncates_long_messages(self):
+        nul.append_debug_log("Stop", "x" * 5000, False, None)
+        entry = json.loads(nul.DEBUG_LOG_FILE.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertLessEqual(len(entry["message_snippet"]), 300)
+
+    def test_rotates_to_max_debug_log_lines(self):
+        for i in range(nul.MAX_DEBUG_LOG_LINES + 10):
+            nul.append_debug_log("Notification", f"msg-{i}", False, None)
+        lines = nul.DEBUG_LOG_FILE.read_text(encoding="utf-8").splitlines()
+        self.assertLessEqual(len(lines), nul.MAX_DEBUG_LOG_LINES)
+        last_entry = json.loads(lines[-1])
+        self.assertIn(f"msg-{nul.MAX_DEBUG_LOG_LINES + 9}", last_entry["message_snippet"])
+
+
 class BuildSlackTextTests(unittest.TestCase):
     def test_includes_reset_time_when_epoch_given(self):
         text = nul.build_slack_text("/tmp/proj", 1735700000)
@@ -222,6 +261,7 @@ class EndToEndSubprocessTests(unittest.TestCase):
         self.webhook_url = f"http://127.0.0.1:{self.server.server_port}/mock"
         self.tmpdir = TemporaryDirectory()
         self.state_file = Path(self.tmpdir.name) / "state.json"
+        self.log_file = Path(self.tmpdir.name) / "debug.log"
 
     def tearDown(self):
         self.server.shutdown()
@@ -232,6 +272,7 @@ class EndToEndSubprocessTests(unittest.TestCase):
         env = os.environ.copy()
         env["SLACK_WEBHOOK_URL"] = self.webhook_url
         env["CLAUDE_LIMIT_NOTIFIER_STATE_FILE"] = str(self.state_file)
+        env["CLAUDE_LIMIT_NOTIFIER_LOG_FILE"] = str(self.log_file)
         env.update(extra_env or {})
         payload = json.dumps({"hook_event_name": "Notification", "message": message, "cwd": "/tmp/proj"})
         return subprocess.run(
