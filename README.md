@@ -17,6 +17,20 @@ Claude AI usage limit reached|1735700000
 
 ## 설치
 
+### 빠른 설치 (macOS / Linux / WSL)
+
+`install.sh` 하나로 아래 2~4단계(설치, 환경 변수 등록, `settings.json` 훅 병합, 웹훅 테스트)를 자동으로 처리합니다. OS(macOS/Linux/WSL)와 로그인 셸(zsh/bash)을 자동 감지해 알맞은 프로필 파일(`~/.zshrc`, `~/.bashrc`, macOS의 `~/.bash_profile`)에 설정을 추가하고, 기존 `settings.json`의 다른 훅/설정은 그대로 두고 필요한 항목만 병합합니다(실행 전 자동 백업). 여러 번 실행해도 중복 등록되지 않습니다. 네이티브 Windows(cmd/PowerShell)에서는 지원하지 않으며, WSL이나 Git Bash에서 실행하세요.
+
+```bash
+git clone https://github.com/seohyunjun/claude-limit-noti
+cd claude-limit-noti
+./install.sh
+```
+
+Slack 웹훅 URL을 물어보면 입력하세요(이미 환경 변수로 설정돼 있으면 건너뜁니다). 완료되면 실제 Slack 채널로 테스트 메시지가 전송됩니다.
+
+### 수동 설치
+
 1. 이 저장소를 클론하거나 `notify_usage_limit.py`를 원하는 위치에 저장합니다.
    ```bash
    git clone https://github.com/seohyunjun/claude-limit-noti ~/.claude/hooks/claude-limit-noti
@@ -72,6 +86,7 @@ Claude AI usage limit reached|1735700000
 - `Claude AI usage limit reached|<epoch>` 포맷은 Claude Code의 비공식/미문서화된 내부 표기입니다. Claude Code 업데이트로 포맷이 바뀌면 정규식(`LIMIT_PATTERNS`)이 더 이상 매칭하지 않을 수 있습니다. 이 경우 스크립트 상단의 `LIMIT_PATTERNS`를 실제 관측된 메시지에 맞게 수정하세요.
 - 텍스트 전용 폴백 패턴(`usage limit reached` 등)은 매칭되어도 정확한 재설정 시각을 알 수 없고, 이 경우 재설정 알림용 워처도 뜨지 않습니다(기다릴 정확한 시각을 모르기 때문).
 - 재설정 알림 워처는 백그라운드 OS 프로세스일 뿐이라, **컴퓨터가 꺼지거나 절전 모드에 들어가면 알림이 오지 않습니다.** 노트북을 덮거나 서버를 재시작하는 사이에 한도가 풀리는 경우가 잦다면 이 방식만으로는 놓칠 수 있습니다.
+- 재설정 시각이 지금부터 **1시간 이상 과거**이거나 **8일 이상 미래**면(잘못 파싱된 epoch 등 이상값 방지용 안전장치), 워처를 아예 띄우지 않고 조용히 건너뜁니다. 정상적인 5시간/주간 한도라면 이 범위에 걸릴 일은 없습니다.
 
 ## 테스트
 
