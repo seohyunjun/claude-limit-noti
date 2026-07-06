@@ -21,6 +21,14 @@ works even if Claude Code itself isn't running at that moment, since
 the watcher is a separate OS process; it does not survive a reboot or
 the machine going to sleep.
 
+To make that reset notification robust across reboots/sleep, the reset
+epoch is also persisted to the state file, and a lightweight
+`--check-resets` mode posts any reset whose time has passed. Register
+`--check-resets` with an OS-level scheduler (cron / systemd timer /
+launchd) so the notice fires even if Claude Code never runs again:
+
+    python3 /path/to/notify_usage_limit.py --check-resets
+
 Usage as a Claude Code hook (settings.json):
     {
       "hooks": {
@@ -81,17 +89,27 @@ MAX_TRACKED_KEYS = 20
 # against a mis-parsed epoch spawning a process that sleeps for years.
 MAX_WATCHER_DELAY_SECONDS = 8 * 24 * 3600
 
-# Order matters: patterns with a captured epoch timestamp are tried first so
-# we can show an exact reset time; the last entry is a text-only fallback in
-# case Claude Code changes the machine-readable format.
-LIMIT_PATTERNS = [
+# Patterns that carry a machine-readable reset epoch (the "|<digits>" suffix).
+# These are strict enough to trust anywhere, including untrusted transcript
+# prose, because ordinary conversation does not emit that exact suffix.
+EPOCH_PATTERNS = [
     re.compile(r"claude\s*(ai)?\s*usage limit reached\|(\d+)", re.IGNORECASE),
     re.compile(r"usage limit reached\|(\d+)", re.IGNORECASE),
-    re.compile(
-        r"(usage limit reached|5-hour limit reached|weekly limit reached|limit will reset)",
-        re.IGNORECASE,
-    ),
 ]
+
+# A text-only fallback in case Claude Code changes the machine-readable format.
+# It is intentionally loose, so it is ONLY trusted for the hook's own `message`
+# field (a controlled notification string) and NOT for transcript prose: the
+# assistant discussing usage limits (including this very tool) would otherwise
+# match and fire a false notification. See find_limit_message(allow_text_only).
+TEXT_ONLY_PATTERN = re.compile(
+    r"(usage limit reached|5-hour limit reached|weekly limit reached|limit will reset)",
+    re.IGNORECASE,
+)
+
+# Kept as the full ordered list (epoch patterns first, then the text-only
+# fallback) for callers/tests that want the permissive behavior.
+LIMIT_PATTERNS = EPOCH_PATTERNS + [TEXT_ONLY_PATTERN]
 
 
 def log(*args):
@@ -124,11 +142,18 @@ def append_debug_log(event_name: str, message: str, matched: bool, epoch) -> Non
         log("could not write debug log:", exc)
 
 
-def find_limit_message(text: str):
-    """Return (matched, reset_epoch_or_None) for the first pattern that hits."""
+def find_limit_message(text: str, allow_text_only: bool = True):
+    """Return (matched, reset_epoch_or_None) for the first pattern that hits.
+
+    allow_text_only gates the loose, epoch-less fallback. Leave it True for the
+    hook's trusted `message` field, but pass False when scanning transcript
+    prose so ordinary conversation mentioning "usage limit reached" (including
+    this tool describing itself) cannot fire a false notification; transcript
+    scans then only trust patterns carrying a machine-readable reset epoch."""
     if not text:
         return False, None
-    for pattern in LIMIT_PATTERNS:
+    patterns = EPOCH_PATTERNS + [TEXT_ONLY_PATTERN] if allow_text_only else EPOCH_PATTERNS
+    for pattern in patterns:
         m = pattern.search(text)
         if not m:
             continue
@@ -204,6 +229,64 @@ def save_state(state: dict) -> None:
 
 def already_notified(dedup_key: str) -> bool:
     return dedup_key in load_state().get("notified_keys", [])
+
+
+def add_pending_reset(epoch: int, cwd: str) -> None:
+    """Persist a reset epoch so the "usage available again" notification can
+    still fire from a later hook invocation even if the detached watcher
+    process dies (e.g. the machine reboots or sleeps before the reset time)."""
+    state = load_state()
+    pending = state.get("pending_resets", {})
+    pending[str(epoch)] = cwd or ""
+    # Cap size; keep the most recent reset windows.
+    if len(pending) > MAX_TRACKED_KEYS:
+        for stale in sorted(pending, key=int)[:-MAX_TRACKED_KEYS]:
+            del pending[stale]
+    state["pending_resets"] = pending
+    save_state(state)
+
+
+def pop_due_resets(now: float) -> list:
+    """Return [(epoch, cwd), ...] for pending resets whose time has passed and
+    that were not already announced, removing them from the pending set. This
+    is the reboot-resilient counterpart to the detached watcher: the reset
+    notification fires on the next hook call after the reset time, at latest."""
+    state = load_state()
+    pending = state.get("pending_resets", {})
+    if not pending:
+        return []
+    notified = set(state.get("notified_keys", []))
+    due = []
+    remaining = {}
+    for epoch_str, cwd in pending.items():
+        try:
+            epoch = int(epoch_str)
+        except (TypeError, ValueError):
+            continue
+        if epoch <= now and f"reset:{epoch}" not in notified:
+            due.append((epoch, cwd))
+        elif epoch > now:
+            remaining[epoch_str] = cwd
+        # (already-notified & due entries are simply dropped)
+    state["pending_resets"] = remaining
+    save_state(state)
+    return due
+
+
+def notify_due_resets(webhook_url: str, now: float) -> None:
+    """Send any reset notifications that are due (fallback for a dead watcher)."""
+    for epoch, cwd in pop_due_resets(now):
+        dedup_key = f"reset:{epoch}"
+        if already_notified(dedup_key):
+            continue
+        if not webhook_url:
+            log("reset is due but SLACK_WEBHOOK_URL is not set")
+            return
+        try:
+            send_slack_message(webhook_url, build_reset_available_text(cwd))
+            mark_notified(dedup_key)
+        except RuntimeError as exc:
+            log(str(exc))
 
 
 def mark_notified(dedup_key: str) -> None:
@@ -316,6 +399,15 @@ def main() -> int:
             cwd = sys.argv[cwd_idx + 1]
         return wait_and_notify_reset(epoch, cwd)
 
+    if "--check-resets" in sys.argv:
+        # Meant to be run by an OS-level scheduler (cron / systemd timer /
+        # launchd), NOT as a Claude Code hook. It posts any reset notification
+        # whose time has passed and that a dead watcher never delivered, so the
+        # "usage available again" notice arrives even if Claude Code never runs
+        # again after a reboot/sleep. Reads only persisted state; no stdin.
+        notify_due_resets(os.environ.get("SLACK_WEBHOOK_URL"), time.time())
+        return 0
+
     webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
 
     if "--test" in sys.argv:
@@ -341,11 +433,18 @@ def main() -> int:
 
     log(f"event={event_name} message={message!r} transcript={transcript_path}")
 
+    # Reboot-resilient fallback: on any hook call, deliver reset notifications
+    # whose time has passed in case the detached watcher process didn't survive.
+    notify_due_resets(webhook_url, time.time())
+
     matched, epoch = find_limit_message(message)
     scanned_text = message
     if not matched and transcript_path:
+        # Transcript prose is untrusted: only accept an epoch-bearing limit
+        # message here, never the loose text-only fallback (which the assistant's
+        # own conversation about usage limits would otherwise trip).
         scanned_text = read_transcript_tail(transcript_path)
-        matched, epoch = find_limit_message(scanned_text)
+        matched, epoch = find_limit_message(scanned_text, allow_text_only=False)
 
     # Recorded unconditionally (not just under CLAUDE_LIMIT_NOTIFIER_DEBUG) so a
     # "no notification arrived" report is diagnosable afterwards even if debug
@@ -369,6 +468,12 @@ def main() -> int:
         send_slack_message(webhook_url, build_slack_text(cwd, epoch))
         mark_notified(dedup_key)
         if epoch:
+            # Two independent paths deliver the "available again" notice:
+            # (1) a detached watcher that fires promptly at the reset time, and
+            # (2) a persisted pending-reset record that any later hook call
+            #     will honor if the watcher died (reboot/sleep). Both share the
+            #     `reset:{epoch}` dedup key so only one message is ever sent.
+            add_pending_reset(epoch, cwd)
             spawn_reset_watcher(epoch, cwd)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)

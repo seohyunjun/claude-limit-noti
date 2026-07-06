@@ -13,6 +13,48 @@ log() { printf '==> %s\n' "$1"; }
 warn() { printf 'WARNING: %s\n' "$1" >&2; }
 die() { printf 'ERROR: %s\n' "$1" >&2; exit 1; }
 
+# The background reset-checker runs without a login shell, so it can't rely on
+# the shell profile. Emit the env vars it needs (webhook is required; the two
+# optional CLAUDE_LIMIT_NOTIFIER_* vars are forwarded only if the user set them,
+# so a customized state-file path / timezone keeps working). One "KEY=VALUE" per
+# line; callers reshape this into cron / systemd / launchd syntax.
+scheduler_env_pairs() {
+  printf 'SLACK_WEBHOOK_URL=%s\n' "$SLACK_WEBHOOK_URL"
+  [ -n "${CLAUDE_LIMIT_NOTIFIER_TZ:-}" ] && printf 'CLAUDE_LIMIT_NOTIFIER_TZ=%s\n' "$CLAUDE_LIMIT_NOTIFIER_TZ"
+  [ -n "${CLAUDE_LIMIT_NOTIFIER_STATE_FILE:-}" ] && printf 'CLAUDE_LIMIT_NOTIFIER_STATE_FILE=%s\n' "$CLAUDE_LIMIT_NOTIFIER_STATE_FILE"
+  return 0
+}
+
+# Idempotently install a crontab entry (every 10 min) that runs --check-resets.
+# Used as the Linux/WSL fallback when a systemd user timer isn't available.
+setup_cron() {
+  local marker="# claude-limit-noti reset-checker"
+  if ! command -v crontab >/dev/null 2>&1; then
+    warn "crontab not found; cannot auto-register a background reset checker."
+    warn "Reset notifications will still fire the next time Claude Code runs."
+    return 0
+  fi
+  local env_prefix=""
+  local pair
+  while IFS= read -r pair; do
+    [ -n "$pair" ] || continue
+    # quote the value half so URLs/paths with special chars survive cron parsing
+    local key="${pair%%=*}" val="${pair#*=}"
+    env_prefix="$env_prefix $key=\"$val\""
+  done < <(scheduler_env_pairs)
+
+  local line="*/10 * * * *${env_prefix} $CHECK_CMD >/dev/null 2>&1 $marker"
+  local current filtered
+  current="$(crontab -l 2>/dev/null || true)"
+  filtered="$(printf '%s\n' "$current" | grep -v -F "$marker" || true)"
+  { printf '%s\n' "$filtered"; printf '%s\n' "$line"; } | grep -v '^$' | crontab -
+  log "Registered cron job (every 10 min) for reset checks."
+  if [ "$OS_KIND" = "wsl" ]; then
+    warn "On WSL the cron daemon isn't started automatically at boot."
+    warn "Start it now: sudo service cron start  (and enable it on boot; otherwise the reset checker won't run until cron is up)."
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # 1. Detect OS
 # ---------------------------------------------------------------------------
@@ -150,7 +192,105 @@ print(f"Merged Notification/Stop hooks into {settings_path}")
 PYEOF
 
 # ---------------------------------------------------------------------------
-# 6. Test the webhook
+# 6. Register an OS-level scheduler that periodically runs `--check-resets`,
+#    so the "usage available again" reset notification fires even if Claude
+#    Code (and thus its hook) never runs again after a reboot/sleep. Set
+#    CLAUDE_LIMIT_NOTI_NO_SCHEDULER=1 to skip this and rely only on the hook.
+# ---------------------------------------------------------------------------
+CHECK_CMD="python3 $INSTALL_DIR/notify_usage_limit.py --check-resets"
+
+if [ -n "${CLAUDE_LIMIT_NOTI_NO_SCHEDULER:-}" ]; then
+  log "CLAUDE_LIMIT_NOTI_NO_SCHEDULER set; skipping background scheduler setup."
+elif [ "$OS_KIND" = "macos" ]; then
+  # launchd LaunchAgent: runs at login (RunAtLoad) and every 10 minutes.
+  PLIST_LABEL="com.claude-limit-noti.reset-checker"
+  PLIST="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  ENV_XML=""
+  while IFS= read -r pair; do
+    [ -n "$pair" ] || continue
+    ENV_XML="$ENV_XML
+    <key>${pair%%=*}</key><string>${pair#*=}</string>"
+  done < <(scheduler_env_pairs)
+  cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$PLIST_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>$INSTALL_DIR/notify_usage_limit.py</string>
+    <string>--check-resets</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>$ENV_XML
+  </dict>
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+PLISTEOF
+  chmod 600 "$PLIST"
+  launchctl unload "$PLIST" 2>/dev/null || true
+  if launchctl load "$PLIST" 2>/dev/null; then
+    log "Registered launchd agent (every 10 min): $PLIST"
+  else
+    warn "Could not load launchd agent. Load it manually: launchctl load $PLIST"
+  fi
+elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+  # Linux with a working user systemd instance: a --user timer is the cleanest
+  # option and can run even while you're logged out (via linger).
+  UNIT_DIR="$HOME/.config/systemd/user"
+  mkdir -p "$UNIT_DIR"
+  ENV_LINES=""
+  while IFS= read -r pair; do
+    [ -n "$pair" ] || continue
+    ENV_LINES="${ENV_LINES}Environment=${pair}
+"
+  done < <(scheduler_env_pairs)
+  cat > "$UNIT_DIR/claude-limit-noti-reset.service" <<UNITEOF
+[Unit]
+Description=claude-limit-noti reset checker
+
+[Service]
+Type=oneshot
+${ENV_LINES}ExecStart=$CHECK_CMD
+UNITEOF
+  cat > "$UNIT_DIR/claude-limit-noti-reset.timer" <<'UNITEOF'
+[Unit]
+Description=Run claude-limit-noti reset checker periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNITEOF
+  chmod 600 "$UNIT_DIR/claude-limit-noti-reset.service"
+  systemctl --user daemon-reload
+  if systemctl --user enable --now claude-limit-noti-reset.timer >/dev/null 2>&1; then
+    log "Registered systemd user timer (every 10 min)."
+    if loginctl enable-linger "$USER" >/dev/null 2>&1; then
+      log "Enabled linger so the timer runs without an active login session."
+    else
+      warn "Timer runs only while you're logged in. To run it always: sudo loginctl enable-linger $USER"
+    fi
+  else
+    warn "Could not enable systemd user timer; falling back to cron."
+    setup_cron
+  fi
+else
+  # Linux/WSL without a usable systemd --user instance.
+  setup_cron
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Test the webhook
 # ---------------------------------------------------------------------------
 log "Sending a test Slack message..."
 if SLACK_WEBHOOK_URL="$SLACK_WEBHOOK_URL" python3 "$INSTALL_DIR/notify_usage_limit.py" --test; then

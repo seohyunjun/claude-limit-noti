@@ -44,6 +44,18 @@ class FindLimitMessageTests(unittest.TestCase):
         self.assertFalse(matched)
         self.assertIsNone(epoch)
 
+    def test_text_only_fallback_rejected_when_disallowed(self):
+        # Assistant prose describing the tool must NOT match when text-only
+        # matching is disabled (as it is for untrusted transcript scans).
+        prose = "I added handling for the 'usage limit reached' notification."
+        self.assertEqual(nul.find_limit_message(prose, allow_text_only=False), (False, None))
+        # ...but the same call still detects a real epoch-bearing message.
+        matched, epoch = nul.find_limit_message(
+            "Claude AI usage limit reached|1735700000", allow_text_only=False
+        )
+        self.assertTrue(matched)
+        self.assertEqual(epoch, 1735700000)
+
     def test_empty_text_does_not_match(self):
         matched, epoch = nul.find_limit_message("")
         self.assertFalse(matched)
@@ -129,6 +141,50 @@ class DedupStateTests(unittest.TestCase):
         self.assertLessEqual(len(state["notified_keys"]), nul.MAX_TRACKED_KEYS)
         self.assertIn(f"key-{nul.MAX_TRACKED_KEYS + 4}", state["notified_keys"])
         self.assertNotIn("key-0", state["notified_keys"])
+
+
+class PendingResetTests(unittest.TestCase):
+    """The persisted pending-reset set is the reboot-resilient fallback for
+    the detached watcher: a reset notification must still fire on a later hook
+    call if the watcher process died before the reset time."""
+
+    def setUp(self):
+        self.tmpdir = TemporaryDirectory()
+        self._orig_state_file = nul.STATE_FILE
+        nul.STATE_FILE = Path(self.tmpdir.name) / "state.json"
+
+    def tearDown(self):
+        nul.STATE_FILE = self._orig_state_file
+        self.tmpdir.cleanup()
+
+    def test_future_reset_is_not_due(self):
+        nul.add_pending_reset(2000, "/proj")
+        self.assertEqual(nul.pop_due_resets(now=1000), [])
+        # Still pending for a later check.
+        self.assertIn("2000", nul.load_state().get("pending_resets", {}))
+
+    def test_past_reset_is_due_once_then_removed(self):
+        nul.add_pending_reset(1000, "/proj")
+        self.assertEqual(nul.pop_due_resets(now=2000), [(1000, "/proj")])
+        # Consumed: not returned again, and no longer pending.
+        self.assertEqual(nul.pop_due_resets(now=2000), [])
+        self.assertNotIn("1000", nul.load_state().get("pending_resets", {}))
+
+    def test_already_notified_reset_is_dropped_not_returned(self):
+        nul.add_pending_reset(1000, "/proj")
+        nul.mark_notified("reset:1000")  # watcher already sent it
+        self.assertEqual(nul.pop_due_resets(now=2000), [])
+        self.assertNotIn("1000", nul.load_state().get("pending_resets", {}))
+
+    def test_notify_due_resets_sends_and_dedups(self):
+        nul.add_pending_reset(1000, "/proj")
+        sent = []
+        with mock.patch.object(nul, "send_slack_message", lambda url, text: sent.append(text)):
+            nul.notify_due_resets("http://webhook", now=2000)
+            nul.notify_due_resets("http://webhook", now=2000)  # second call: nothing due
+        self.assertEqual(len(sent), 1)
+        self.assertIn("한도 초기화", sent[0])
+        self.assertTrue(nul.already_notified("reset:1000"))
 
 
 class DebugLogTests(unittest.TestCase):
@@ -284,10 +340,55 @@ class EndToEndSubprocessTests(unittest.TestCase):
             timeout=15,
         )
 
+    def _run_hook_with_transcript(self, transcript_lines):
+        env = os.environ.copy()
+        env["SLACK_WEBHOOK_URL"] = self.webhook_url
+        env["CLAUDE_LIMIT_NOTIFIER_STATE_FILE"] = str(self.state_file)
+        env["CLAUDE_LIMIT_NOTIFIER_LOG_FILE"] = str(self.log_file)
+        transcript = Path(self.tmpdir.name) / "transcript.jsonl"
+        transcript.write_text("".join(json.dumps(x) + "\n" for x in transcript_lines))
+        # Stop-style invocation: empty message, detection relies on transcript.
+        payload = json.dumps(
+            {
+                "hook_event_name": "Stop",
+                "message": "",
+                "cwd": "/tmp/proj",
+                "transcript_path": str(transcript),
+            }
+        )
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "notify_usage_limit.py")],
+            input=payload,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=15,
+        )
+
     def test_no_match_sends_nothing_and_exits_zero(self):
         result = self._run_hook("waiting for your input")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(self.received, [])
+
+    def test_transcript_prose_mentioning_limit_does_not_notify(self):
+        # Regression: the assistant discussing "usage limit reached" in the
+        # transcript must not fire a (false) notification — only an epoch-
+        # bearing message should. This is the exact silent false-positive the
+        # debug log surfaced.
+        result = self._run_hook_with_transcript(
+            [{"message": {"content": "I updated the 'usage limit reached' handler and tests."}}]
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.received, [])
+
+    def test_transcript_with_real_epoch_message_still_notifies(self):
+        epoch = int(nul.time.time()) + 3600
+        result = self._run_hook_with_transcript(
+            [{"message": {"content": f"Claude AI usage limit reached|{epoch}"}}]
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(self.received), 1)
+        self.assertIn("사용량 한도 도달", self.received[0])
 
     def test_limit_reached_sends_slack_message(self):
         epoch = int(nul.time.time()) + 3600
@@ -314,6 +415,42 @@ class EndToEndSubprocessTests(unittest.TestCase):
 
         self.assertEqual(len(self.received), 2, "reset-available message never arrived")
         self.assertIn("한도 초기화", self.received[1])
+
+    def _run_check_resets(self):
+        env = os.environ.copy()
+        env["SLACK_WEBHOOK_URL"] = self.webhook_url
+        env["CLAUDE_LIMIT_NOTIFIER_STATE_FILE"] = str(self.state_file)
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "notify_usage_limit.py"), "--check-resets"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=15,
+        )
+
+    def test_check_resets_delivers_due_reset_from_state(self):
+        # Simulates the OS scheduler path: a reset epoch was persisted (limit
+        # was hit earlier) and its time has now passed, but the watcher died
+        # (e.g. reboot). --check-resets must still deliver the notice — exactly
+        # once — and clear the pending record.
+        self.state_file.write_text(
+            json.dumps({"pending_resets": {str(int(nul.time.time()) - 5): "/tmp/proj"}})
+        )
+        result = self._run_check_resets()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(self.received), 1)
+        self.assertIn("한도 초기화", self.received[0])
+        # Second run has nothing due -> no duplicate.
+        self._run_check_resets()
+        self.assertEqual(len(self.received), 1)
+
+    def test_check_resets_ignores_future_reset(self):
+        self.state_file.write_text(
+            json.dumps({"pending_resets": {str(int(nul.time.time()) + 3600): "/tmp/proj"}})
+        )
+        result = self._run_check_resets()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.received, [])
 
 
 if __name__ == "__main__":
